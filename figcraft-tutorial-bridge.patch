@@ -1,0 +1,871 @@
+From 4c4efb1b6a5cc27c55cfd2750342baa4ccf15ac5 Mon Sep 17 00:00:00 2001
+From: Manish Poduval <manupodu@gmail.com>
+Date: Sat, 17 Oct 2026 09:09:55 +0000
+Subject: [PATCH] Web: tutorial bridge (postMessage control channel) and
+ ui.landmarks
+
+A page that embeds the web build in an iframe can drive and read the editor
+through postMessage: the control channel's engine.execute, document.inspect,
+node.get, ui.inspect, ui.set and the new ui.landmarks, for pages on allowed
+origins only, with sharing, plugins, saving, exporting and links refused.
+
+ui.landmarks reports named interface rectangles (toolbar groups, panels,
+layer rows, the auto layout section's controls) and layers' screen boxes,
+so a tutorial can point at a control.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01EsXKeosDsZWrhaobuimNEM
+---
+ Cargo.lock                            |   1 +
+ apps/figcraft-web/Cargo.toml          |   3 +-
+ apps/figcraft-web/src/bridge.rs       | 170 ++++++++++++++++++++++++++
+ apps/figcraft-web/src/main.rs         |  10 ++
+ apps/figcraft-web/src/policy.rs       | 149 ++++++++++++++++++++++
+ apps/figcraft-web/src/web.rs          |   7 +-
+ crates/ui-egui/src/control.rs         |  21 ++++
+ crates/ui-egui/src/landmarks.rs       |  53 ++++++++
+ crates/ui-egui/src/landmarks_tests.rs |  79 ++++++++++++
+ crates/ui-egui/src/layers.rs          |   1 +
+ crates/ui-egui/src/layout_panel.rs    |  22 ++++
+ crates/ui-egui/src/lib.rs             |   5 +
+ crates/ui-egui/src/toolbar.rs         |   8 ++
+ docs/web-bridge.md                    |  97 +++++++++++++++
+ 14 files changed, 624 insertions(+), 2 deletions(-)
+ create mode 100644 apps/figcraft-web/src/bridge.rs
+ create mode 100644 apps/figcraft-web/src/policy.rs
+ create mode 100644 crates/ui-egui/src/landmarks.rs
+ create mode 100644 crates/ui-egui/src/landmarks_tests.rs
+ create mode 100644 docs/web-bridge.md
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 9baacd5..1699c50 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1727,6 +1727,7 @@ dependencies = [
+  "figcraft-ui-egui",
+  "js-sys",
+  "log",
++ "serde_json",
+  "wasm-bindgen",
+  "wasm-bindgen-futures",
+  "web-sys",
+diff --git a/apps/figcraft-web/Cargo.toml b/apps/figcraft-web/Cargo.toml
+index 2f1a819..855423b 100644
+--- a/apps/figcraft-web/Cargo.toml
++++ b/apps/figcraft-web/Cargo.toml
+@@ -19,6 +19,7 @@ figcraft-ui-egui = { workspace = true }
+ figcraft-collab-net = { workspace = true }
+ egui = { workspace = true }
+ log = { workspace = true }
++serde_json = { workspace = true }
+ 
+ [target.'cfg(target_arch = "wasm32")'.dependencies]
+ # `wgpu` pulls egui-wgpu's defaults: WebGPU plus the WebGL2 fallback.
+@@ -26,4 +27,4 @@ eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit"] }
+ wasm-bindgen = "0.2"
+ js-sys = "0.3"
+ wasm-bindgen-futures = "0.4"
+-web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlCanvasElement", "HtmlElement", "HtmlAnchorElement", "Node", "Blob", "BlobPropertyBag", "Url", "Location", "MediaQueryList", "Navigator", "Gamepad", "GamepadButton", "GamepadMappingType"] }
++web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlCanvasElement", "HtmlElement", "HtmlAnchorElement", "Node", "Blob", "BlobPropertyBag", "Url", "Location", "MediaQueryList", "Navigator", "Gamepad", "GamepadButton", "GamepadMappingType", "MessageEvent", "EventTarget", "Event"] }
+diff --git a/apps/figcraft-web/src/bridge.rs b/apps/figcraft-web/src/bridge.rs
+new file mode 100644
+index 0000000..0d8ca83
+--- /dev/null
++++ b/apps/figcraft-web/src/bridge.rs
+@@ -0,0 +1,170 @@
++//! The tutorial bridge: lets a page that embeds the web build in an `<iframe>` drive and read the
++//! editor through `postMessage`, using the same control channel the desktop app serves on its
++//! loopback socket (`figcraft_ui_egui::control`, `docs/control-protocol.md`).
++//!
++//! The embedding page posts
++//!
++//! ```json
++//! {"type": "figcraft", "id": 1, "method": "engine.execute", "params": {"command": "shape.rectangle", "params": {}}}
++//! ```
++//!
++//! and gets back, posted to its own origin only,
++//!
++//! ```json
++//! {"type": "figcraft", "id": 1, "ok": true, "result": {"id": 12}}
++//! {"type": "figcraft", "id": 1, "ok": false, "error": "message"}
++//! ```
++//!
++//! `bridge.hello` answers at once with the bridge version and its methods; a page posts it until it
++//! gets an answer, which tells it the app has started.
++//!
++//! Safety:
++//! - Only pages on [`crate::policy::ORIGINS`] (and `http://localhost` / `http://127.0.0.1` on any port, and any
++//!   origin listed in the `FIGCRAFT_BRIDGE_ORIGINS` build variable, comma-separated) are answered;
++//!   messages from anywhere else are ignored without a reply.
++//! - Only the methods in [`crate::policy::METHODS`] run: no input injection, no windows, no screenshots to paths.
++//! - `engine.execute` refuses commands that could reach outside the page or the visitor's machine
++//!   (sharing and live sessions, plugins, saving and exporting files, opening links), also inside a
++//!   `command.batch`.
++//! - At most `MAX_PENDING` requests wait at once, each message at most `MAX_BYTES`.
++
++use std::cell::RefCell;
++use std::collections::HashMap;
++use std::rc::Rc;
++use std::sync::Arc;
++use std::sync::atomic::AtomicBool;
++use std::sync::mpsc;
++
++use figcraft_ui_egui::{ControlReply, ControlRequest, FigApp};
++use serde_json::{Value, json};
++use wasm_bindgen::JsCast as _;
++use wasm_bindgen::closure::Closure;
++
++use crate::policy::{MAX_BYTES, MAX_PENDING, METHODS, VERSION, allowed, check};
++
++/// A request parsed from a message, with who to answer.
++struct Incoming {
++    id: Value,
++    method: String,
++    params: Value,
++    to: Peer,
++}
++
++/// The page that asked: its window and origin (replies go to that origin only).
++#[derive(Clone)]
++struct Peer {
++    window: web_sys::Window,
++    origin: String,
++}
++
++pub struct Bridge {
++    inbox: Rc<RefCell<Vec<Incoming>>>,
++    waiting: HashMap<u64, (Value, Peer)>,
++    tx: mpsc::Sender<ControlReply>,
++    rx: mpsc::Receiver<ControlReply>,
++    next: u64,
++    _listener: Option<Closure<dyn FnMut(web_sys::MessageEvent)>>,
++}
++
++impl Bridge {
++    /// Listens for `message` events on the window; each accepted one wakes the app for a frame.
++    pub fn install(ctx: egui::Context) -> Self {
++        let inbox: Rc<RefCell<Vec<Incoming>>> = Rc::new(RefCell::new(Vec::new()));
++        let (tx, rx) = mpsc::channel();
++        let sink = inbox.clone();
++        let listener = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |e: web_sys::MessageEvent| {
++            let origin = e.origin();
++            if !allowed(&origin) {
++                return;
++            }
++            let Some(msg) = parse(&e.data()) else { return };
++            if msg.get("type").and_then(Value::as_str) != Some("figcraft") || msg.get("ok").is_some() {
++                return;
++            }
++            // The page that posted (a cross-origin parent arrives as a WindowProxy, so no
++            // `instanceof Window` check), else our parent.
++            let window = e
++                .source()
++                .map(wasm_bindgen::JsCast::unchecked_into::<web_sys::Window>)
++                .or_else(|| web_sys::window().and_then(|w| w.parent().ok().flatten()));
++            let Some(window) = window else { return };
++            let to = Peer { window, origin };
++            let id = msg.get("id").cloned().unwrap_or(Value::Null);
++            let method = msg.get("method").and_then(Value::as_str).unwrap_or("").to_string();
++            let params = msg.get("params").cloned().unwrap_or_else(|| json!({}));
++            let mut q = sink.borrow_mut();
++            if q.len() >= MAX_PENDING {
++                post(&to, &json!({"type": "figcraft", "id": id, "ok": false, "error": "too many requests waiting"}));
++                return;
++            }
++            q.push(Incoming { id, method, params, to });
++            drop(q);
++            ctx.request_repaint();
++        });
++        let installed = web_sys::window().is_some_and(|w| w.add_event_listener_with_callback("message", listener.as_ref().unchecked_ref()).is_ok());
++        if !installed {
++            log::warn!("figcraft-web: the tutorial bridge couldn't listen for messages");
++        }
++        Self { inbox, waiting: HashMap::new(), tx, rx, next: 1, _listener: installed.then_some(listener) }
++    }
++
++    /// Before the frame: hand accepted requests to the app's control queue (it runs them at the
++    /// start of the frame) and answer the ones that never reach it.
++    pub fn pump(&mut self, app: &mut FigApp) {
++        let incoming = std::mem::take(&mut *self.inbox.borrow_mut());
++        for m in incoming {
++            if m.method == "bridge.hello" {
++                post(&m.to, &json!({"type": "figcraft", "id": m.id, "ok": true, "result": {"version": VERSION, "methods": METHODS}}));
++                continue;
++            }
++            if let Err(e) = check(&m.method, &m.params) {
++                post(&m.to, &json!({"type": "figcraft", "id": m.id, "ok": false, "error": e}));
++                continue;
++            }
++            let key = self.next;
++            self.next = self.next.wrapping_add(1);
++            self.waiting.insert(key, (m.id, m.to));
++            app.control_queue.push(ControlRequest {
++                id: json!(key),
++                method: m.method,
++                params: m.params,
++                reply: self.tx.clone(),
++                cancelled: Arc::new(AtomicBool::new(false)),
++            });
++        }
++    }
++
++    /// After the frame: post the replies back to the pages that asked.
++    pub fn flush(&mut self) {
++        while let Ok(r) = self.rx.try_recv() {
++            let Some(key) = r.id.as_u64() else { continue };
++            let Some((id, to)) = self.waiting.remove(&key) else { continue };
++            let msg = match r.result {
++                Ok(v) => json!({"type": "figcraft", "id": id, "ok": true, "result": v}),
++                Err(e) => json!({"type": "figcraft", "id": id, "ok": false, "error": e}),
++            };
++            post(&to, &msg);
++        }
++    }
++}
++
++/// A message's data as JSON: a JSON string, or a structured-clone object (read back through
++/// `JSON.stringify`). Oversized or unreadable data is ignored.
++fn parse(data: &wasm_bindgen::JsValue) -> Option<Value> {
++    let text = match data.as_string() {
++        Some(s) => s,
++        None => js_sys::JSON::stringify(data).ok()?.as_string()?,
++    };
++    if text.len() > MAX_BYTES {
++        return None;
++    }
++    serde_json::from_str(&text).ok()
++}
++
++fn post(to: &Peer, msg: &Value) {
++    let Ok(text) = serde_json::to_string(msg) else { return };
++    let Ok(value) = js_sys::JSON::parse(&text) else { return };
++    if let Err(e) = to.window.post_message(&value, &to.origin) {
++        log::warn!("figcraft-web: couldn't reply to {}: {e:?}", to.origin);
++    }
++}
+diff --git a/apps/figcraft-web/src/main.rs b/apps/figcraft-web/src/main.rs
+index 7eed2ff..935b79a 100644
+--- a/apps/figcraft-web/src/main.rs
++++ b/apps/figcraft-web/src/main.rs
+@@ -19,6 +19,16 @@
+ //! loaded, so a bookmark opens a shared file. `join` takes the rest of the fragment: put it last.
+ //! The link carries the session's secret; a fragment is never sent to the web host, but the address
+ //! bar and the browser history keep it, so the URL is as private as the link itself.
++//!
++//! Tutorial bridge: a page on an allowed origin that embeds the app in an `<iframe>` can drive and
++//! read it with `postMessage` (`bridge.rs`, `policy.rs`, `docs/web-bridge.md`).
++
++// Built on every target so its tests run natively; only the browser build calls it.
++#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
++mod policy;
++
++#[cfg(target_arch = "wasm32")]
++mod bridge;
+ 
+ #[cfg(any(target_arch = "wasm32", test))]
+ mod query;
+diff --git a/apps/figcraft-web/src/policy.rs b/apps/figcraft-web/src/policy.rs
+new file mode 100644
+index 0000000..b03e1f4
+--- /dev/null
++++ b/apps/figcraft-web/src/policy.rs
+@@ -0,0 +1,149 @@
++//! What the tutorial bridge (`bridge.rs`) lets an embedding page do: which origins it answers,
++//! which control methods they may call, and which commands `engine.execute` refuses. Plain logic,
++//! built on every target so its tests run natively.
++
++use serde_json::Value;
++
++/// Bumped when the message format or the method list changes.
++pub const VERSION: u32 = 1;
++
++/// Pages allowed to use the bridge (exact origins).
++pub const ORIGINS: &[&str] = &["https://uxuiopen.com", "https://www.uxuiopen.com"];
++
++/// Methods an embedding page may call.
++pub const METHODS: &[&str] =
++    &["bridge.hello", "engine.execute", "engine.commands", "document.inspect", "node.get", "ui.inspect", "ui.set", "ui.landmarks"];
++
++/// Command ids (or id prefixes ending in `.`) `engine.execute` refuses.
++pub const BLOCKED: &[&str] = &[
++    "collab.",
++    "plugin.",
++    "plugins.",
++    "app.",
++    "help.",
++    "file.save",
++    "file.saveAs",
++    "file.export",
++    "file.exportSvg",
++    "export.",
++    "devResource.open",
++    "link.open",
++];
++
++pub const MAX_PENDING: usize = 32;
++pub const MAX_BYTES: usize = 4 * 1024 * 1024;
++
++/// Whether `origin` may use the bridge.
++pub fn allowed(origin: &str) -> bool {
++    if ORIGINS.contains(&origin) {
++        return true;
++    }
++    if let Some(extra) = option_env!("FIGCRAFT_BRIDGE_ORIGINS")
++        && extra.split(',').map(str::trim).any(|o| !o.is_empty() && o == origin)
++    {
++        return true;
++    }
++    local(origin)
++}
++
++/// `http://localhost` or `http://127.0.0.1`, with or without a port (a developer's own machine).
++fn local(origin: &str) -> bool {
++    ["http://localhost", "http://127.0.0.1"].iter().any(|h| {
++        origin == *h
++            || origin
++                .strip_prefix(h)
++                .and_then(|r| r.strip_prefix(':'))
++                .is_some_and(|port| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()))
++    })
++}
++
++/// Why `command` (with `params`) is refused, if it is; looks inside `command.batch` steps too.
++pub fn refused(command: &str, params: &Value, depth: usize) -> Option<String> {
++    if depth > 8 {
++        return Some("command.batch is nested too deeply".into());
++    }
++    let hit = BLOCKED.iter().any(|b| if b.ends_with('.') { command.starts_with(b) } else { command == *b });
++    if hit {
++        return Some(format!("`{command}` isn't available to embedding pages"));
++    }
++    if command == "command.batch"
++        && let Some(steps) = params.get("commands").and_then(Value::as_array)
++    {
++        for s in steps {
++            let c = s.get("command").and_then(Value::as_str).unwrap_or("");
++            let p = s.get("params").cloned().unwrap_or(Value::Null);
++            if let Some(why) = refused(c, &p, depth + 1) {
++                return Some(why);
++            }
++        }
++    }
++    None
++}
++
++/// Whether a method (with its params) may run; the error to reply with if not.
++pub fn check(method: &str, params: &Value) -> Result<(), String> {
++    if !METHODS.contains(&method) {
++        return Err(format!("method `{method}` isn't available to embedding pages"));
++    }
++    if method == "engine.execute" {
++        let c = params.get("command").and_then(Value::as_str).ok_or("`command` required")?;
++        let p = params.get("params").cloned().unwrap_or(Value::Null);
++        if let Some(why) = refused(c, &p, 0) {
++            return Err(why);
++        }
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use serde_json::json;
++
++    #[test]
++    fn origins() {
++        assert!(allowed("https://uxuiopen.com"));
++        assert!(allowed("https://www.uxuiopen.com"));
++        assert!(allowed("http://localhost:3000"));
++        assert!(allowed("http://127.0.0.1"));
++        assert!(!allowed("https://uxuiopen.com.evil.example"));
++        assert!(!allowed("http://localhost.evil.example"));
++        assert!(!allowed("http://localhost:3000x"));
++        assert!(!allowed("http://localhost:"));
++        assert!(!allowed("https://example.com"));
++        assert!(!allowed("null"));
++        assert!(!allowed(""));
++    }
++
++    #[test]
++    fn methods_and_commands() {
++        assert!(check("document.inspect", &json!({})).is_ok());
++        assert!(check("ui.landmarks", &json!({"nodes": [1]})).is_ok());
++        assert!(check("engine.execute", &json!({"command": "shape.rectangle", "params": {}})).is_ok());
++        assert!(check("ui.pointer", &json!({})).is_err());
++        assert!(check("window.new", &json!({})).is_err());
++        assert!(check("app.quit", &json!({})).is_err());
++        assert!(check("engine.execute", &json!({})).is_err());
++        assert!(check("engine.execute", &json!({"command": "collab.share"})).is_err());
++        assert!(check("engine.execute", &json!({"command": "plugin.run"})).is_err());
++        assert!(check("engine.execute", &json!({"command": "file.save"})).is_err());
++        assert!(check("engine.execute", &json!({"command": "file.saveAs"})).is_err());
++        // An exact block doesn't catch a longer id that only starts the same.
++        assert!(check("engine.execute", &json!({"command": "file.new"})).is_ok());
++    }
++
++    #[test]
++    fn batches_are_checked_step_by_step() {
++        let ok = json!({"command": "command.batch", "params": {"commands": [{"command": "node.create", "params": {"type": "frame"}}]}});
++        assert!(check("engine.execute", &ok).is_ok());
++        let bad = json!({"command": "command.batch", "params": {"commands": [{"command": "node.create"}, {"command": "collab.share"}]}});
++        assert!(check("engine.execute", &bad).is_err());
++        let nested = json!({"command": "command.batch", "params": {"commands": [{"command": "command.batch", "params": {"commands": [{"command": "app.quit"}]}}]}});
++        assert!(check("engine.execute", &nested).is_err());
++        let mut deep = json!({"command": "node.create"});
++        for _ in 0..12 {
++            deep = json!({"command": "command.batch", "params": {"commands": [deep]}});
++        }
++        assert!(check("engine.execute", &json!({"command": "command.batch", "params": deep["params"]})).is_err());
++    }
++}
+diff --git a/apps/figcraft-web/src/web.rs b/apps/figcraft-web/src/web.rs
+index 2921362..5663945 100644
+--- a/apps/figcraft-web/src/web.rs
++++ b/apps/figcraft-web/src/web.rs
+@@ -47,7 +47,8 @@ pub fn start() {
+                         let link = js_sys::decode_uri_component(link).ok().and_then(|s| s.as_string()).unwrap_or_else(|| link.to_string());
+                         figcraft_ui_egui::live::open_invite(&mut fig, &link);
+                     }
+-                    Ok(Box::new(WebShell { fig }))
++                    let bridge = crate::bridge::Bridge::install(cc.egui_ctx.clone());
++                    Ok(Box::new(WebShell { fig, bridge }))
+                 }),
+             )
+             .await;
+@@ -66,12 +67,16 @@ fn query() -> String {
+ 
+ struct WebShell {
+     fig: FigApp,
++    /// Requests from an embedding page (a tutorial), run through the control channel.
++    bridge: crate::bridge::Bridge,
+ }
+ 
+ impl eframe::App for WebShell {
+     // `FigApp::ui` runs its own per-frame logic first (fonts, theme), like the desktop app.
+     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
++        self.bridge.pump(&mut self.fig);
+         self.fig.ui(ui);
++        self.bridge.flush();
+     }
+ }
+ 
+diff --git a/crates/ui-egui/src/control.rs b/crates/ui-egui/src/control.rs
+index a66e1ed..1759a55 100644
+--- a/crates/ui-egui/src/control.rs
++++ b/crates/ui-egui/src/control.rs
+@@ -6,6 +6,7 @@
+ //! - `engine.commands {}` — every command with its params doc
+ //! - `document.inspect {depth?, allPages?}` / `node.get {id, depth?}`
+ //! - `ui.inspect {}` — panel/tab/tool state, canvas rect, timings
++//! - `ui.landmarks {nodes?}` — named interface rects (see `landmarks`), the given layers' screen rects
+ //! - `ui.pointer {kind: down|move|up|click|double|hover|drag, x, y (page) | sx, sy (screen), to?, shift?, alt?, cmd?}`
+ //! - `ui.key {key, shift?, cmd?, alt?}` — a shortcut as if typed on the canvas
+ //! - `ui.type {text}` — type into the text being edited
+@@ -265,6 +266,26 @@ pub fn handle(app: &mut FigApp, ctx: &Context, method: &str, p: &Value) -> Resul
+         }
+         "window.list" => Ok(crate::windows::list(app)),
+         "window.focus" => crate::windows::focus(app, ctx, p.get("id").and_then(Value::as_u64).ok_or("`id` required")?),
++        "ui.landmarks" => {
++            // Where things are on screen, for a page that embeds the app (a tutorial pointing at a
++            // control or a layer): named interface landmarks, the requested layers' boxes, the canvas.
++            let mut nodes = serde_json::Map::new();
++            if let (Some(ids), Ok(doc)) = (p.get("nodes").and_then(Value::as_array), app.session.doc()) {
++                for id in ids.iter().filter_map(Value::as_u64).take(200) {
++                    if let Some(b) = doc.world_bounds(figcraft_doc::NodeId(id)) {
++                        let (a, z) = (app.to_screen(b.x0, b.y0), app.to_screen(b.x1, b.y1));
++                        nodes.insert(id.to_string(), json!([a.x, a.y, z.x, z.y]));
++                    }
++                }
++            }
++            let c = app.canvas.rect;
++            Ok(json!({
++                "landmarks": crate::landmarks::list(ctx),
++                "nodes": nodes,
++                "canvas": [c.min.x, c.min.y, c.max.x, c.max.y],
++                "zoom": app.session.ds().map(|d| d.view.zoom).unwrap_or(1.0),
++            }))
++        }
+         "ui.inspect" => {
+             let mut v = app.inspect();
+             // The name of the control with the keyboard (what a screen reader announces).
+diff --git a/crates/ui-egui/src/landmarks.rs b/crates/ui-egui/src/landmarks.rs
+new file mode 100644
+index 0000000..7a7200b
+--- /dev/null
++++ b/crates/ui-egui/src/landmarks.rs
+@@ -0,0 +1,53 @@
++//! Named screen rectangles for parts of the interface, so a page that embeds the web build (a
++//! tutorial, see `apps/figcraft-web/src/bridge.rs`) can point at a control: "the Auto layout
++//! section", "the frame tool", "the Card row in the layers panel". Panels record them while they
++//! draw; `ui.landmarks` reports the ones drawn in the last frame, in logical points (CSS pixels in
++//! the browser).
++
++use std::collections::BTreeMap;
++
++use egui::{Context, Id, Rect};
++
++/// Most landmarks kept: the layer rows of a long file shouldn't grow the map without end.
++const MAX: usize = 400;
++
++#[derive(Clone, Default)]
++struct Marks(BTreeMap<String, (Rect, u64)>);
++
++fn key() -> Id {
++    Id::new("figcraft_landmarks")
++}
++
++/// Record `rect` as the landmark `name` for this frame (empty, inverted or non-finite rects are
++/// ignored, so a control scrolled out of view or not drawn simply isn't reported).
++pub fn mark(ctx: &Context, name: &str, rect: Rect) {
++    if !rect.is_finite() || !rect.is_positive() {
++        return;
++    }
++    let pass = ctx.cumulative_pass_nr();
++    ctx.data_mut(|d| {
++        let m = d.get_temp_mut_or_default::<Marks>(key());
++        if m.0.len() >= MAX && !m.0.contains_key(name) {
++            // Drop the stalest one to make room.
++            if let Some(old) = m.0.iter().min_by_key(|(_, (_, p))| *p).map(|(k, _)| k.clone()) {
++                m.0.remove(&old);
++            }
++        }
++        m.0.insert(name.to_string(), (rect, pass));
++    });
++}
++
++/// Like [`mark`], clipped to what the `ui` shows (rows in a scroll area).
++pub fn mark_visible(ui: &egui::Ui, name: &str, rect: Rect) {
++    mark(ui.ctx(), name, rect.intersect(ui.clip_rect()));
++}
++
++/// The landmarks drawn in the last frame (or this one): `{name: [x0, y0, x1, y1]}`.
++pub fn list(ctx: &Context) -> BTreeMap<String, [f32; 4]> {
++    let pass = ctx.cumulative_pass_nr();
++    ctx.data(|d| d.get_temp::<Marks>(key()))
++        .map(|m| {
++            m.0.into_iter().filter(|(_, (_, p))| pass.saturating_sub(*p) <= 1).map(|(k, (r, _))| (k, [r.min.x, r.min.y, r.max.x, r.max.y])).collect()
++        })
++        .unwrap_or_default()
++}
+diff --git a/crates/ui-egui/src/landmarks_tests.rs b/crates/ui-egui/src/landmarks_tests.rs
+new file mode 100644
+index 0000000..e17f4b1
+--- /dev/null
++++ b/crates/ui-egui/src/landmarks_tests.rs
+@@ -0,0 +1,79 @@
++//! `ui.landmarks`: named interface rectangles and layer boxes on screen, for pages that embed the
++//! web build (the tutorial bridge). The rectangles must be where the controls really are: a click
++//! in the middle of `design.layout.add` adds auto layout.
++use egui::pos2;
++use serde_json::{Value, json};
++
++use crate::control::handle;
++use crate::live_tests::Harness;
++
++fn landmarks(h: &mut Harness, nodes: &[u64]) -> Value {
++    h.frames(3);
++    handle(&mut h.app, &h.ctx, "ui.landmarks", &json!({"nodes": nodes})).unwrap()
++}
++
++fn center(r: &Value) -> egui::Pos2 {
++    let v: Vec<f32> = r.as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect();
++    pos2((v[0] + v[2]) / 2.0, (v[1] + v[3]) / 2.0)
++}
++
++#[test]
++fn landmarks_point_at_real_controls() {
++    let (mut h, _) = Harness::new();
++    let s = &mut h.app.session;
++    let card = s.execute("node.create", &json!({"type": "frame", "name": "Card", "x": 400, "y": 200, "width": 200, "height": 300})).unwrap()["id"]
++        .as_u64()
++        .unwrap();
++    s.execute("node.create", &json!({"type": "rectangle", "parent": card, "x": 20, "y": 20, "width": 100, "height": 40})).unwrap();
++    s.execute("node.create", &json!({"type": "rectangle", "parent": card, "x": 20, "y": 100, "width": 100, "height": 40})).unwrap();
++    s.execute("select.set", &json!({"ids": [card]})).unwrap();
++
++    let l = landmarks(&mut h, &[card]);
++    for name in [
++        "toolbar",
++        "toolbar.frame",
++        "toolbar.mode.design",
++        "panel.left",
++        "panel.right",
++        "design.layout.header",
++        "design.layout.add",
++        "design.layout.dimensions",
++    ] {
++        assert!(l["landmarks"].get(name).is_some(), "{name} is reported: {}", l["landmarks"]);
++    }
++    assert!(l["landmarks"].get(format!("layer.{card}")).is_some(), "the card's layer row is reported");
++    assert!(l["landmarks"].get("design.layout.spacing").is_none(), "no spacing fields before auto layout");
++    // The card's box is on the canvas, as big as the card at this zoom.
++    let b: Vec<f64> = l["nodes"][card.to_string()].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
++    let c: Vec<f64> = l["canvas"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
++    let z = l["zoom"].as_f64().unwrap();
++    assert!((b[2] - b[0] - 200.0 * z).abs() < 1.0 && (b[3] - b[1] - 300.0 * z).abs() < 1.0, "{b:?} at zoom {z}");
++    assert!(b[0] >= c[0] - 1000.0 && b[1] >= c[1] - 1000.0, "{b:?} relative to the canvas {c:?}");
++
++    // Clicking the reported + adds auto layout.
++    let add = center(&l["landmarks"]["design.layout.add"]);
++    h.click(add);
++    h.frames(2);
++    let doc = h.app.session.doc().unwrap();
++    assert!(doc.node(figcraft_doc::NodeId(card)).unwrap().layout.is_some(), "the click at {add:?} landed on Add auto layout");
++
++    let l = landmarks(&mut h, &[]);
++    for name in ["design.layout.remove", "design.layout.direction", "design.layout.alignment", "design.layout.spacing"] {
++        assert!(l["landmarks"].get(name).is_some(), "{name} is reported once there is auto layout");
++    }
++    assert!(l["landmarks"].get("design.layout.add").is_none(), "the + became a −");
++}
++
++#[test]
++fn landmarks_not_drawn_are_dropped() {
++    let (mut h, _) = Harness::new();
++    let s = &mut h.app.session;
++    let f = s.execute("node.create", &json!({"type": "frame", "width": 100, "height": 100})).unwrap()["id"].as_u64().unwrap();
++    s.execute("select.set", &json!({"ids": [f]})).unwrap();
++    assert!(landmarks(&mut h, &[])["landmarks"].get("design.layout.header").is_some());
++    h.app.session.execute("select.none", &json!({})).unwrap();
++    assert!(landmarks(&mut h, &[])["landmarks"].get("design.layout.header").is_none(), "nothing selected: no layout section");
++    // Unknown and junk ids are skipped.
++    let l = handle(&mut h.app, &h.ctx, "ui.landmarks", &json!({"nodes": [999_999, "x", -1]})).unwrap();
++    assert_eq!(l["nodes"], json!({}));
++}
+diff --git a/crates/ui-egui/src/layers.rs b/crates/ui-egui/src/layers.rs
+index 32f66f8..a676f71 100644
+--- a/crates/ui-egui/src/layers.rs
++++ b/crates/ui-egui/src/layers.rs
+@@ -777,6 +777,7 @@ fn layers(app: &mut FigApp, ui: &mut Ui) {
+         for row in rows.iter().take(last).skip(first) {
+             let Some(n) = doc.node(row.id) else { continue };
+             let (r, resp) = ui.allocate_exact_size(vec2(w, ROW), Sense::click_and_drag());
++            crate::landmarks::mark_visible(ui, &format!("layer.{}", row.id.0), r);
+             let selected = sel.contains(&row.id);
+             a11y::layer_row(&mut app.ui.nav, &resp);
+             if sel.last() == Some(&row.id) {
+diff --git a/crates/ui-egui/src/layout_panel.rs b/crates/ui-egui/src/layout_panel.rs
+index 11d3036..18c31f8 100644
+--- a/crates/ui-egui/src/layout_panel.rs
++++ b/crates/ui-egui/src/layout_panel.rs
+@@ -42,17 +42,33 @@ pub fn layout_section(app: &mut FigApp, ui: &mut Ui, doc: &Document, sel: &[Node
+     } else {
+         vec![]
+     };
++    let y0 = ui.cursor().top();
+     if widgets::section_header(ui, title, &btns, false).is_some() {
+         app.run(if has_al { "layout.remove" } else { "layout.add" }, json!({"ids": ids}));
+     }
++    let head = band(ui, y0);
++    crate::landmarks::mark(ui.ctx(), "design.layout.header", head);
++    if !btns.is_empty() {
++        // The header's + / − button (`widgets::section_header` puts it 8 points from the right).
++        let b = Rect::from_min_size(pos2(head.max.x - 32.0, head.center().y - 12.0), vec2(24.0, 24.0));
++        crate::landmarks::mark(ui.ctx(), if has_al { "design.layout.remove" } else { "design.layout.add" }, b);
++    }
+     let from_main = tr("In an instance, this comes from the main component");
+     if let Some(Some(l)) = &al {
++        let y = ui.cursor().top();
+         ui.add_enabled_ui(!in_instance, |ui| direction(app, ui, &ids, l)).response.on_disabled_hover_text(from_main);
++        crate::landmarks::mark(ui.ctx(), "design.layout.direction", band(ui, y));
+     }
++    let y = ui.cursor().top();
+     dimensions(app, ui, doc, sel, has_al, nested, from_main);
++    crate::landmarks::mark(ui.ctx(), "design.layout.dimensions", band(ui, y));
+     if let Some(Some(l)) = &al {
++        let y = ui.cursor().top();
+         alignment(app, ui, &ids, l);
++        crate::landmarks::mark(ui.ctx(), "design.layout.alignment", band(ui, y));
++        let y = ui.cursor().top();
+         spacing(app, ui, &ids, l);
++        crate::landmarks::mark(ui.ctx(), "design.layout.spacing", band(ui, y));
+         ui.add_enabled_ui(!in_instance, |ui| {
+             advanced(app, ui, &ids, l);
+             if l.mode == LayoutMode::Grid && sel.len() == 1 {
+@@ -77,6 +93,12 @@ pub fn layout_section(app: &mut FigApp, ui: &mut Ui, doc: &Document, sel: &[Node
+     }
+ }
+ 
++/// The full-width band of the panel from `y0` down to where the next widget goes.
++fn band(ui: &Ui, y0: f32) -> Rect {
++    let x = ui.max_rect().x_range();
++    Rect::from_x_y_ranges(x, y0..=ui.cursor().top().max(y0))
++}
++
+ fn direction(app: &mut FigApp, ui: &mut Ui, ids: &[NodeId], l: &AutoLayout) {
+     row(ui, 32.0, |ui| {
+         let items = [(Icon::LayoutV, tr("Vertical")), (Icon::LayoutH, tr("Horizontal")), (Icon::LayoutGrid, tr("Grid"))];
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index e6a14ed..cdc0d59 100644
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -33,6 +33,7 @@ pub mod home_recents;
+ pub mod i18n;
+ pub mod icons;
+ pub mod import_report;
++pub mod landmarks;
+ pub mod layers;
+ pub mod layout_panel;
+ pub mod list_drag;
+@@ -119,6 +120,8 @@ mod idle_tests;
+ #[cfg(test)]
+ mod import_report_tests;
+ #[cfg(test)]
++mod landmarks_tests;
++#[cfg(test)]
+ mod layers_behaviour_tests;
+ #[cfg(test)]
+ mod layers_drag_tests;
+@@ -1473,6 +1476,7 @@ impl FigApp {
+                         LeftTab::Assets => i18n::tr("Assets"),
+                     };
+                     a11y::region(&mut self.ui.nav, ui, a11y::Region::Layers, egui::accesskit::Role::Pane, label);
++                    landmarks::mark(ui.ctx(), "panel.left", ui.max_rect());
+                     layers::left_panel(self, ui)
+                 });
+         }
+@@ -1489,6 +1493,7 @@ impl FigApp {
+                         RightTab::Inspect => i18n::tr("Dev Mode"),
+                     };
+                     a11y::region(&mut self.ui.nav, ui, a11y::Region::Properties, egui::accesskit::Role::Pane, label);
++                    landmarks::mark(ui.ctx(), "panel.right", ui.max_rect());
+                     right::right_panel(self, ui)
+                 });
+         }
+diff --git a/crates/ui-egui/src/toolbar.rs b/crates/ui-egui/src/toolbar.rs
+index 6da9bad..f18037d 100644
+--- a/crates/ui-egui/src/toolbar.rs
++++ b/crates/ui-egui/src/toolbar.rs
+@@ -95,6 +95,7 @@ fn main_toolbar(app: &mut FigApp, ui: &mut Ui, canvas: Rect, t: &Tokens) {
+         let icon = g.tools.iter().find(|(tid, _)| *tid == shown).map(|(_, i)| *i).unwrap_or(Icon::Move);
+         let r = Rect::from_center_size(pos2(x + cell / 2.0, cy), vec2(cell, cell));
+         let resp = tool_cell(ui, t, r, ("tool", g.key), icon, in_group, &format!("{}  {}", tr(shown.label()), pretty_shortcut(shown.shortcut())));
++        crate::landmarks::mark(ui.ctx(), &format!("toolbar.{}", g.key), r);
+         if in_group {
+             a11y::prefer(&mut app.ui.nav, Region::Toolbar, resp.id);
+         }
+@@ -170,10 +171,17 @@ fn main_toolbar(app: &mut FigApp, ui: &mut Ui, canvas: Rect, t: &Tokens) {
+         crate::RightTab::Inspect => 3,
+     };
+     let seg = Rect::from_min_size(pos2(x, cy - 18.0), vec2(4.0 * 34.0 + 4.0, 36.0));
++    crate::landmarks::mark(ui.ctx(), "toolbar", rect);
++    crate::landmarks::mark(ui.ctx(), "toolbar.modes", seg);
+     ui.painter().rect_filled(seg, CornerRadius::same(8), t.field);
+     for (i, (icon, tip)) in modes.iter().enumerate() {
+         let r = Rect::from_min_size(pos2(seg.min.x + 2.0 + i as f32 * 34.0, seg.min.y + 2.0), vec2(34.0, 32.0));
+         let resp = ui.interact(r, ui.id().with(("mode", i)), Sense::click()).on_hover_text(*tip);
++        crate::landmarks::mark(
++            ui.ctx(),
++            ["toolbar.mode.draw", "toolbar.mode.design", "toolbar.mode.prototype", "toolbar.mode.inspect"].get(i).copied().unwrap_or("toolbar.mode"),
++            r,
++        );
+         a11y::toggle(&resp, tip, i == active);
+         if i == active {
+             ui.painter().rect_filled(r, CornerRadius::same(6), t.panel);
+diff --git a/docs/web-bridge.md b/docs/web-bridge.md
+new file mode 100644
+index 0000000..bd08bcc
+--- /dev/null
++++ b/docs/web-bridge.md
+@@ -0,0 +1,97 @@
++# Web build: the tutorial bridge
++
++A page that embeds the web build in an `<iframe>` can drive and read the editor with
++`postMessage`. Tutorials use it to set up a lesson's file, check each step as the learner works,
++point at controls and layers, and show a step's solution. It is the control channel
++([control-protocol.md](control-protocol.md)) over `postMessage` instead of a loopback socket, with a
++smaller method list.
++
++Code: `apps/figcraft-web/src/bridge.rs` (messages), `apps/figcraft-web/src/policy.rs` (what is
++allowed, with tests), `crates/ui-egui/src/landmarks.rs` (named screen rectangles).
++
++## Messages
++
++The page posts to the iframe's window:
++
++```js
++frame.contentWindow.postMessage({ type: "figcraft", id: 1, method: "document.inspect", params: { depth: 2 } }, "https://design.example.com");
++```
++
++and receives, posted to its own origin only:
++
++```js
++{ type: "figcraft", id: 1, ok: true, result: { … } }
++{ type: "figcraft", id: 1, ok: false, error: "message" }
++```
++
++`id` is anything the page chooses; it comes back unchanged. Requests run at the start of the
++editor's next frame, in order. The data may be an object or a JSON string.
++
++Post `bridge.hello` until it answers to know the app has started:
++
++```js
++{ type: "figcraft", id: "hello", method: "bridge.hello" }
++→ { type: "figcraft", id: "hello", ok: true, result: { version: 1, methods: [ … ] } }
++```
++
++## Methods
++
++| Method | What it does |
++|---|---|
++| `bridge.hello {}` | The bridge version and its methods |
++| `engine.execute {command, params?}` | Run a command (see `engine.commands`; refused commands below) |
++| `engine.commands {}` | Every command with its parameters |
++| `document.inspect {depth?, allPages?}` | The document as JSON, selection and undo history included |
++| `node.get {id, depth?}` | One layer and its children |
++| `ui.inspect {}` | Interface state: tabs, tool, panels, dialogs, focus, status |
++| `ui.set {…}` | Switch tabs and panels (as in the control protocol) |
++| `ui.landmarks {nodes?}` | Where things are on screen (below) |
++
++### `ui.landmarks {nodes?: [id, …]}`
++
++```json
++{
++  "landmarks": { "toolbar.frame": [x0, y0, x1, y1], "design.layout.add": [ … ], "layer.12": [ … ] },
++  "nodes": { "12": [x0, y0, x1, y1] },
++  "canvas": [x0, y0, x1, y1],
++  "zoom": 1.0
++}
++```
++
++Rectangles are in logical points from the iframe's top left, which are CSS pixels at the
++browser's default zoom. Only landmarks drawn in the last frame are listed, so a panel section
++that isn't showing is simply absent. Names so far:
++
++- `panel.left`, `panel.right`, `toolbar`, `toolbar.modes`, `toolbar.mode.{draw,design,prototype,inspect}`
++- `toolbar.<group>` for each tool group button (`toolbar.move`, `toolbar.frame`, `toolbar.shape`, …)
++- `layer.<id>` for each layer row visible in the layers panel
++- `design.layout.header`, `design.layout.add` / `design.layout.remove`, `design.layout.direction`,
++  `design.layout.dimensions`, `design.layout.alignment`, `design.layout.spacing`
++
++Add more with `crate::landmarks::mark(ctx, name, rect)` where a control is drawn.
++
++## Safety
++
++- **Origins.** Only pages on the origins in `policy::ORIGINS`, on `http://localhost` or
++  `http://127.0.0.1` (any port), or listed in the `FIGCRAFT_BRIDGE_ORIGINS` build variable
++  (comma-separated, read at compile time) get an answer. Everything else is ignored silently.
++- **Methods.** No input injection (`ui.pointer`, `ui.key`, `ui.type`, `ui.input`), windows,
++  screenshots or `app.quit`.
++- **Commands.** `engine.execute` refuses sharing and live sessions (`collab.*`), plugins, saving
++  and exporting files, opening links and `app.*`, also inside `command.batch` steps.
++- At most 32 requests wait at once; a message is at most 4 MiB.
++
++## Hosting
++
++Serve the build as in [HOSTING](../packaging/web/README.md), and let the tutorial's site frame
++it: don't send `X-Frame-Options`, or send a `Content-Security-Policy: frame-ancestors` that lists
++the tutorial's origin.
++
++Build the site (it lands in `dist/web`), with any extra origin your tutorial runs on allowed:
++
++```sh
++cd apps/figcraft-web
++FIGCRAFT_BRIDGE_ORIGINS="https://learn.example.com" trunk build --release
++```
++
++`cargo xtask wasm` checks that everything still compiles for wasm32.
+-- 
+2.43.0
+
