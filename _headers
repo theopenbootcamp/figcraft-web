@@ -1,6 +1,9 @@
 # Netlify / Cloudflare Pages header rules (see HOSTING.md). Other hosts: set the same headers.
 /*
   X-Content-Type-Options: nosniff
+  # Its own browser process when embedded on the same site (the lessons on uxuiopen.com), so
+  # the editor never shares the lesson page's main thread.
+  Origin-Agent-Cluster: ?1
 
 /*.wasm
   Content-Type: application/wasm

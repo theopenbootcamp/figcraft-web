@@ -7,6 +7,8 @@ AddType text/javascript .js
 </IfModule>
 
 <IfModule mod_headers.c>
+  # Its own browser process when embedded on the same site, so it never shares the page's main thread.
+  Header set Origin-Agent-Cluster "?1"
   <FilesMatch "\.(wasm|js)$">
     Header set Cache-Control "public, max-age=31536000, immutable"
   </FilesMatch>
