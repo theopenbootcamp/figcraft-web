@@ -6,8 +6,8 @@
   <title>FigCraft</title>
   
 <script type="module">
-import init, * as bindings from './figcraft-web-841588f67fc57489.js';
-const wasm = await init({ module_or_path: './figcraft-web-841588f67fc57489_bg.wasm' });
+import init, * as bindings from './figcraft-web-d9dc7db19625f66a.js';
+const wasm = await init({ module_or_path: './figcraft-web-d9dc7db19625f66a_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -26,7 +26,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
       #figcraft_loading { color: #b8b8b8; }
     }
   </style>
-<link rel="modulepreload" href="./figcraft-web-841588f67fc57489.js" crossorigin="anonymous" integrity="sha384-STf2fXOoFv4q4cGcRPEooKLnStw+K7NqeKMJQWJ/9CkJTWKflPTi9w0q8xZgZGKR"><link rel="preload" href="./figcraft-web-841588f67fc57489_bg.wasm" crossorigin="anonymous" integrity="sha384-Kvydf+Bo3E6EIXn93H1c5iHOgl1oJTxFEHPajYhkjv7HQleTnkJ6mkeh5WX/HhwH" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="./figcraft-web-d9dc7db19625f66a.js" crossorigin="anonymous" integrity="sha384-RkbpapoX3T5/S6N2m0c1noM3R3o/TfY0o7BTCExtr3vTnT4J/8ngszaPX9u0M+Or"><link rel="preload" href="./figcraft-web-d9dc7db19625f66a_bg.wasm" crossorigin="anonymous" integrity="sha384-0GCWXjnfEyL5VRqQQ921tT0TFA5p42Wj6GfHr04T+13Y3+Y/mQ6gbK6Fx/30oYhq" as="fetch" type="application/wasm"></head>
 <body>
   <canvas id="figcraft_canvas"></canvas>
   <div id="figcraft_loading">Loading . . .</div>

@@ -12,7 +12,7 @@ AddType text/javascript .js
   <FilesMatch "\.(wasm|js)$">
     Header set Cache-Control "public, max-age=31536000, immutable"
   </FilesMatch>
-  <FilesMatch "^index\.html$">
+  <FilesMatch "^(index\.html|brand\.json)$">
     Header set Cache-Control "no-cache"
   </FilesMatch>
 </IfModule>
